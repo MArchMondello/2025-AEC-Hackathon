@@ -1,22 +1,11 @@
 import json
-import re
-import os
-
-
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import unary_union
-from itertools import combinations
+import re
+import os
+import numpy as np
 
-
-def polygon_from_coords(coords):
-    """
-    Converts a list of {x, y, z} dicts to a Shapely Polygon (2D).
-    Ignores the 'z' coordinate.
-    """
-    points_2d = [(pt["x"], pt["y"]) for pt in coords]
-    return Polygon(points_2d)
-
-def compute_spaces_convex_hull_ratio(data):
+def compute_spaces_convex_hull_ratio(data, transport_thresholds = [3.2 , 16.5]):
     """
     Given a JSON dictionary 'data' that contains 'spaces' with their coordinates and room types,
     compute the ratio of the sum of areas of [bathroom, corridor, bedroom, kitchen]
@@ -26,12 +15,10 @@ def compute_spaces_convex_hull_ratio(data):
     # Room types we care about
     #relevant_room_types = {"bathroom", "corridor", "kitchen"}
     relevant_room_types = {"bathroom","corridor", "kitchen"}
-    #Checking the bathroom
 
     polygons = []
     total_area = 0.0
 
-    individual_areas = []
 
     # Loop through the 'spaces' entry in the JSON
     for space_id, space_info in data.get("spaces", {}).items():
@@ -53,8 +40,6 @@ def compute_spaces_convex_hull_ratio(data):
             # Accumulate its area
             total_area += poly.area
 
-            individual_areas.append({room_type:poly.area})
-
     # If we have no polygons, avoid errors
     if not polygons:
         return 0.0
@@ -62,208 +47,53 @@ def compute_spaces_convex_hull_ratio(data):
     # Combine polygons into a single MultiPolygon and get its convex hull
     multi_poly = MultiPolygon(polygons)
     hull = multi_poly.convex_hull
-
     hull_area = hull.area
     
+    #compute the rotation of the hull points against the longest X-oriented hull side
+    hull_pts = hull.exterior.coords
+    hull_vecs = [
+        [hull_pts[e + 1][0] - hull_pts[e][0], hull_pts[e + 1][1] - hull_pts[e][1]]
+        if e < len(hull_pts) - 1 #last and first are identical
+        else [hull_pts[0][0] - hull_pts[-1][0], hull_pts[0][1] - hull_pts[-1][1]]
+        for e in range(0,len(hull_pts)-1)
+        ]
+    sorted_hull_vecs = sorted(hull_vecs, 
+        key=lambda x : 
+        x[1]**2 + x[0]**2,
+        reverse=True 
+        )
+    #find the longest vector which is an X for the floorplan
+    vecX = np.array([1,0])
+    vecY = np.array([0,1])
+    for vec in sorted_hull_vecs:
+        vec_test = np.array(vec) / np.linalg.norm(vec)
+        dot_product = np.dot(vecX, vec_test) > abs(np.dot(vecY, vec_test))
+        if dot_product:
+            vecX = vec_test
+            break
+    # Calculate the angle between the vector and the x-axis
+    angle = np.arctan2(vecX[1], vecX[0])
+    # Create the rotation matrix
+    rotation_matrix = np.array([
+        [np.cos(-angle), -np.sin(-angle)],
+        [np.sin(-angle), np.cos(-angle)]
+        ])
+    newPts = [
+        np.dot(rotation_matrix, np.array(pt))
+        for pt in hull_pts
+        ]
+    xs = [pt[0] for pt in newPts]
+    ys = [pt[1] for pt in newPts]
+    hull_x = max(xs) - min(xs)
+    hull_y = max(ys) - min(ys)
+    hull_dim = sorted([hull_x,hull_y])
+    isTransportable = min(hull_dim) <= transport_thresholds[0] and max(hull_dim) <= transport_thresholds[1]
+
     # Compute the ratio, guarding against division by zero
     if hull_area == 0:
         return 0.0
     else:
-        return total_area / hull_area, hull_area, individual_areas
-
-
-def compute_space_combinations_ratios(data):
-    """
-    Given a JSON dictionary 'data' that contains 'spaces' with their coordinates and room types,
-    compute the ratio of the sum of areas to the total area of the convex hull
-    for each combination of bathroom, corridor, kitchen:
-
-      1) bathroom alone
-      2) corridor alone
-      3) kitchen alone
-      4) bathroom + corridor
-      5) bathroom + kitchen
-      6) corridor + kitchen
-      7) bathroom + corridor + kitchen
-
-    Returns a dict mapping each combo to (ratio, hull_area, total_area).
-    """
-
-    # Define the possible room types of interest
-    relevant_room_types = {"bathroom", "corridor", "kitchen"}
-
-    # Separate polygons by room type
-    polygons_by_type = {
-        "bathroom": [],
-        "corridor": [],
-        "kitchen": []
-    }
-
-    rooms_numer = 0
-    # Loop through the 'spaces' entry in the JSON
-    for space_id, space_info in data.get("spaces", {}).items():
-        room_type = space_info.get("room_type", "").lower()
-        rooms_numer += 1
-        
-        print("Room type = ", room_type)
-        # If it's one of the desired room types, parse
-        if room_type in relevant_room_types:
-            coords = space_info.get("coordinates", [])
-            polygon_coords = [(c["x"], c["y"]) for c in coords]
-            poly = Polygon(polygon_coords)
-            polygons_by_type[room_type].append(poly)
-
-    
-    # Only include room types that are present in the JSON.
-    active_room_types = [rt for rt in ["bathroom", "corridor", "kitchen"] if polygons_by_type[rt]]
-    print(active_room_types)
-    if not active_room_types:
-        # If none of the room types are present, return an empty dict.
-        return {}
-
-    # Generate all subsets (combos) of the 3 room types
-    # 1-element combos, 2-element combos, 3-element combos
-    combos = []
-    for r in range(1, len(active_room_types) + 1):
-        combos.extend(combinations(active_room_types, r))
-    # Dictionary to store results
-    # e.g., results["bathroom,corridor"] = (ratio, hull_area, total_area)
-    results = {}
-
-    for combo in combos:
-        combo_name = ",".join(sorted(combo))  # e.g. "bathroom,corridor"
-        
-        # Collect all polygons for these room types
-        combo_polygons = []
-        for room_t in combo:
-            combo_polygons.extend(polygons_by_type[room_t])
-
-        if not combo_polygons:
-            # If no polygons found for this combo, ratio is 0
-            results[combo_name] = (0.0, 0.0, 0.0)
-            continue
-
-        # Combine polygons into a single MultiPolygon
-        multi_poly = MultiPolygon(combo_polygons)
-        # Sum of areas
-        total_area = sum(poly.area for poly in combo_polygons)
-        # Compute convex hull
-        hull = multi_poly.convex_hull
-        hull_area = hull.area
-
-        weight = 1 / ((rooms_numer + 1)/2 - len(combo))
-        
-
-        if hull_area == 0:
-            ratio = 0.0
-        else:
-            ratio = (total_area / hull_area) * weight
-
-        # Store ratio, hull_area, and total_area
-        results[combo_name] = (ratio, hull_area, total_area)
-
-    return results
-
-def compute_space_combinations_ratios_by_apartment(data):
-    """
-    Given a JSON dictionary 'data' with a "spaces" entry containing each space's
-    coordinates, room_type, and apartment name, compute for each apartment the ratio
-    of (sum of areas of selected spaces) to (convex hull area of those spaces) for every
-    combination of room types among bathroom, corridor, and kitchen.
-    
-    For a combination that contains only one polygon, the ratio is forced to 1.
-    
-    Only the room types that are present in an apartment are considered. For example, if an
-    apartment does not contain any kitchen, no combination including "kitchen" will be computed.
-    
-    Returns:
-        A dict of the form:
-        
-        {
-          "Apartment 1": {
-              "bathroom": (ratio, hull_area, total_area),
-              "corridor": (ratio, hull_area, total_area),
-              "bathroom,corridor": (ratio, hull_area, total_area),
-              ... (other combinations available)
-          },
-          "Apartment 2": {
-              ... similar structure ...
-          },
-          ...
-        }
-    """
-    # Room types of interest.
-    relevant_room_types = {"bathroom", "corridor", "kitchen"}
-    
-    # Group spaces by apartment.
-    apartments = {}
-    rooms_numer = 0
-    for space_id, space_info in data.get("spaces", {}).items():
-        room_type = space_info.get("room_type", "").lower()
-        rooms_numer += 1
-        # Only consider relevant room types.
-        if room_type not in relevant_room_types:
-            continue
-        
-        apartment = space_info.get("apartment", "Unknown")
-        poly = polygon_from_coords(space_info.get("coordinates", []))
-        
-        # Initialize structure for this apartment if needed.
-        if apartment not in apartments:
-            apartments[apartment] = {
-                "bathroom": [],
-                "corridor": [],
-                "kitchen": []
-            }
-        apartments[apartment][room_type].append(poly)
-    
-    # Now compute ratios for each apartment.
-    results = {}
-    for apartment, poly_dict in apartments.items():
-        # Identify which room types are actually present.
-        active_types = [rt for rt in ["bathroom", "corridor", "kitchen"] if poly_dict[rt]]
-        if not active_types:
-            # No relevant spaces for this apartment.
-            continue
-
-        # Prepare a dictionary for this apartment's combinations.
-        apt_results = {}
-        # Generate all non-empty combinations from the active room types.
-        for r in range(1, len(active_types) + 1):
-            for combo in combinations(active_types, r):
-                # The combo key is a comma-separated list of room types (sorted for consistency).
-                combo_key = ",".join(sorted(combo))
-                
-                # Gather all polygons for the combination.
-                combo_polygons = []
-                for rt in combo:
-                    combo_polygons.extend(poly_dict[rt])
-                
-                if not combo_polygons:
-                    apt_results[combo_key] = (0.0, 0.0, 0.0)
-                    continue
-                
-                # Sum the areas of the individual polygons.
-                total_area = sum(poly.area for poly in combo_polygons)
-                
-
-                weight = 1 / ((rooms_numer + 1)/2 - len(combo))
-                weight = 1
-                # If only one polygon is in the combo, force the hull area to equal its area.
-                if len(combo_polygons) == 1:
-                    hull_area = total_area
-                else:
-                    multi_poly = MultiPolygon(combo_polygons)
-                    hull_area = multi_poly.convex_hull.area
-                
-                ratio = (total_area / hull_area) * weight if hull_area != 0 else 0.0
-                
-                apt_results[combo_key] = (ratio, hull_area, total_area)
-        
-        results[apartment] = apt_results
-    
-    return results
-
+        return total_area / hull_area, hull_area, isTransportable 
 
 def load_jsons_and_compute_ratios(base_json_folder):
     """
@@ -299,9 +129,8 @@ def load_jsons_and_compute_ratios(base_json_folder):
                         continue
 
                     # 3) Compute the ratio
-                    ratio, hull_area, individual_areas = compute_spaces_convex_hull_ratio(data)
+                    ratio, hull_area = compute_spaces_convex_hull_ratio(data)
 
-                    #print("Individual areas = ", individual_areas)
                     maximum_area = 3.2 * 14.
 
                     if hull_area > maximum_area:
@@ -310,35 +139,27 @@ def load_jsons_and_compute_ratios(base_json_folder):
                         weight = 1.
 
                     # Store the ratio in our results
-                    results.setdefault(folder_name, {})[file_name] = ratio
+                    results.setdefault(folder_name, {})[file_name] = ratio * weight
                     results.setdefault(folder_name, {})["area"] = hull_area
 
     return results
 
-
 if __name__ == "__main__":
 
 
-    json_folder_path = "/Users/diego/Desktop/Escritorio_MacBook_Pro_de_Diego/hackathon/2025-AEC-Hackathon/json"
+    json_folder_path = "C:\\Users\MarcoMondello\\OneDrive - GROPYUS\\Documents\\AEC Hackaton 2025"
 
     # Get a list of all items in the directory and filter by folders
-    results = load_jsons_and_compute_ratios(json_folder_path)
+    #results = load_jsons_and_compute_ratios(json_folder_path)
 
-    with open('/Users/diego/Desktop/Escritorio_MacBook_Pro_de_Diego/2025-AEC-Hackathon/json/ReferenceDesign_02/Reference02.json', 'r') as file:
+    #print(results)
+
+
+    with open('C:\\Users\\MarcoMondello\\OneDrive - GROPYUS\\Documents\\AEC Hackaton 2025\\json\\12009.json', 'r') as file:
         data = json.load(file) 
 
-    iou = compute_space_combinations_ratios(data)
+    iou = compute_spaces_convex_hull_ratio(data)
 
-    print("---------------")
+
     print(iou)
-
-    apartment_ratios = compute_space_combinations_ratios_by_apartment(data)
-    for apartment, combo_results in apartment_ratios.items():
-        print(f"Apartment: {apartment}")
-        for combo, (ratio, hull_area, total_area) in combo_results.items():
-            print(f"  Combination: {combo}")
-            print(f"    Ratio:      {ratio:.3f}")
-            print(f"    Hull Area:  {hull_area:.2f}")
-            print(f"    Total Area: {total_area:.2f}")
-        print()
     
